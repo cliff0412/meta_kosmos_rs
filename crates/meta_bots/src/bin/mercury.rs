@@ -15,9 +15,9 @@ use std::{
 };
 use tracing::{debug, info, instrument::WithSubscriber, warn, Level};
 
-use meta_address::{get_dex_address, get_token_address};
+use meta_address::{get_bot_address, get_dex_address, get_rpc_info, get_token_address};
 use meta_bots::AppConfig;
-use meta_common::enums::{ContractType, Dex, Network, Token};
+use meta_common::enums::{Bot, ContractType, DexExchange, Network, Token};
 use meta_contracts::{
     bindings::{
         flash_bots_router::{FlashBotsRouter, UniswapWethParams},
@@ -38,20 +38,17 @@ struct Opts {
     #[options(help = "blockchain network, such as ETH, BSC")]
     network: Network,
 
-    #[options(help = "base token, such as WETH, WBNB")]
+    #[options(help = "base token, such as USDT")]
     base_token: Token,
 
-    #[options(help = "quote token, such as USDC, BUSD")]
+    #[options(help = "quote token, tokenIn, such as WBNB, BUSD")]
     quote_token: Token,
 
     #[options(help = "dex a, such as PANCAKE")]
-    dex_a: Dex,
+    dex_a: DexExchange,
 
     #[options(help = "dex a, such as BISWAP")]
-    dex_b: Dex,
-
-    #[options(help = "the Ethereum node endpoint (HTTP or WS)")]
-    url: Option<String>,
+    dex_b: DexExchange,
 
     #[options(help = "path to your private key", default = "/tmp/pk")]
     private_key_path: PathBuf,
@@ -69,54 +66,46 @@ struct Opts {
     one_shot: bool,
 }
 
-async fn run<P: JsonRpcClient + 'static + PubsubClient>(
-    opts: Opts,
-    provider: Provider<P>,
-) -> anyhow::Result<()> {
+async fn run(opts: Opts) -> anyhow::Result<()> {
+    let rpc_info = get_rpc_info(opts.network).unwrap();
+    info!(
+        "run bot with arguments, chain: {} base_token: {}, quote_token: {},  ws provider url: {:?}",
+        opts.network, opts.base_token, opts.quote_token, rpc_info.wsUrls[0]
+    );
+
+    let provider =
+        Provider::<Ws>::connect(rpc_info.wsUrls[0].clone()).await.expect("ws connect error");
     let provider = provider.interval(Duration::from_millis(opts.interval));
 
     info!("privatekey path {:?}", opts.private_key_path); // {:?} is explained in https://doc.rust-lang.org/std/fmt/index.html
-    let private_key = std::fs::read_to_string(opts.private_key_path)
-        .unwrap()
-        .trim()
-        .to_string();
-
+    let private_key = std::fs::read_to_string(opts.private_key_path).unwrap().trim().to_string();
     let wallet: LocalWallet = private_key.parse().unwrap();
 
-    let wallet = wallet.with_chain_id(Chain::BinanceSmartChain);
-    let liquidator_address = wallet.address();
+    let wallet = wallet.with_chain_id(rpc_info.chainId);
+    let executor_address = wallet.address();
     let client = SignerMiddleware::new(provider, wallet);
-    let client = NonceManagerMiddleware::new(client, liquidator_address);
+    let client = NonceManagerMiddleware::new(client, executor_address);
     let client = Arc::new(client);
-    info!("profits will be sent to {:?}", liquidator_address);
+    info!("profits will be sent to {:?}", executor_address);
     let quote_amt_in = u128::pow(10, 17);
 
-    let quote_addr = get_token_address(opts.quote_token)
-        .unwrap()
-        .address(opts.network)
-        .unwrap();
-    let base_addr = get_token_address(opts.base_token)
-        .unwrap()
-        .address(opts.network)
-        .unwrap();
+    let quote_addr = get_token_address(opts.quote_token).unwrap().address(opts.network).unwrap();
+    let base_addr = get_token_address(opts.base_token).unwrap().address(opts.network).unwrap();
     debug!("quote_addr: {}, base_addr: {} ", quote_addr, base_addr);
 
     let quote_asset = Erc20Wrapper::new(opts.network, quote_addr, client.clone()).await;
     let base_asset = Erc20Wrapper::new(opts.network, base_addr, client.clone()).await;
 
-    let flashbots_router = FlashBotsRouter::new(
-        address_from_str("0x53d19Fd4A403dCE6C8e4a1D0F3d0D12245813275"),
-        client.clone(),
-    );
+    let bot_address =
+        get_bot_address(Bot::ATOMIC_SWAP_ROUTER).unwrap().address(opts.network).unwrap();
+    let flashbots_router = FlashBotsRouter::new(bot_address, client.clone());
 
-    let market_a_factory_addr = get_dex_address(opts.dex_a.clone(), opts.network)
+    let market_a_factory_addr = get_dex_address(opts.dex_a.clone(), opts.network, ContractType::UNI_V2_FACTORY)
         .unwrap()
-        .address(ContractType::UNI_V2_FACTORY)
-        .unwrap();
-    let market_a_swap_router_addr = get_dex_address(opts.dex_a.clone(), opts.network)
+        .address;
+    let market_a_swap_router_addr = get_dex_address(opts.dex_a.clone(), opts.network, ContractType::UNI_V2_ROUTER)
         .unwrap()
-        .address(ContractType::UNI_V2_ROUTER)
-        .unwrap();
+        .address;
 
     let market_a = UniswapV2::new(
         opts.network,
@@ -126,14 +115,14 @@ async fn run<P: JsonRpcClient + 'static + PubsubClient>(
         client.clone(),
     );
 
-    let market_b_factory_addr = get_dex_address(opts.dex_b.clone(), opts.network)
-        .unwrap()
-        .address(ContractType::UNI_V2_FACTORY)
-        .unwrap();
-    let market_b_swap_router_addr = get_dex_address(opts.dex_b.clone(), opts.network)
-        .unwrap()
-        .address(ContractType::UNI_V2_ROUTER)
-        .unwrap();
+    let market_b_factory_addr =
+        get_dex_address(opts.dex_b.clone(), opts.network, ContractType::UNI_V2_FACTORY)
+            .unwrap()
+            .address;
+    let market_b_swap_router_addr =
+        get_dex_address(opts.dex_b.clone(), opts.network, ContractType::UNI_V2_ROUTER)
+            .unwrap()
+            .address;
     let biswap = UniswapV2::new(
         opts.network,
         opts.dex_b,
@@ -148,9 +137,7 @@ async fn run<P: JsonRpcClient + 'static + PubsubClient>(
             base_addr,  // BUSD
         )
         .await;
-    let market_a_pool_contract_wrapper = Rc::new(RefCell::<
-        UniswapV2PairWrapper<NonceManagerMiddleware<SignerMiddleware<Provider<P>, LocalWallet>>>,
-    >::new(market_a_pool_contract_wrapper));
+    let market_a_pool_contract_wrapper = Rc::new(RefCell::new(market_a_pool_contract_wrapper));
 
     let market_b_pool_contract_wrapper = biswap
         .get_pair_contract_wrapper(
@@ -158,9 +145,8 @@ async fn run<P: JsonRpcClient + 'static + PubsubClient>(
             base_addr,  // BUSD
         )
         .await;
-    let market_b_pool_contract_wrapper = Rc::new(RefCell::<UniswapV2PairWrapper<_>>::new(
-        market_b_pool_contract_wrapper,
-    ));
+    let market_b_pool_contract_wrapper =
+        Rc::new(RefCell::<UniswapV2PairWrapper<_>>::new(market_b_pool_contract_wrapper));
 
     let last_block = client
         .get_block(BlockNumber::Latest)
@@ -179,20 +165,13 @@ async fn run<P: JsonRpcClient + 'static + PubsubClient>(
             .from_block(last_block - 2)
     };
 
-    let mut swap_events = market_a_swap_event_filter
-        .subscribe()
-        .await
-        .unwrap()
-        .with_meta();
+    let mut swap_events = market_a_swap_event_filter.subscribe().await.unwrap().with_meta();
 
     let mut last_block = 0;
 
     let mut last_ts = 0;
     loop {
-        let current_ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let current_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         debug!("current_ts {:?}", current_ts);
         if current_ts - last_ts > 2 {
             debug!("ping keep connection");
@@ -217,8 +196,12 @@ async fn run<P: JsonRpcClient + 'static + PubsubClient>(
                         last_block,
                     )
                     .await;
-                    info!("{:?} {:?}", last_block, price_diff);
-                    if price_diff.abs() > 40f64 {
+                    info!(
+                        "curretn block number {:?}, price diff {:?}",
+                        meta.block_number, price_diff
+                    );
+                    if price_diff.abs() > 20f64 {
+                        info!("start arbitraging");
                         let params = get_atomic_arb_call_params(
                             market_a_pool_contract_wrapper.clone(),
                             market_b_pool_contract_wrapper.clone(),
@@ -253,19 +236,7 @@ async fn main_impl() -> anyhow::Result<()> {
 
     let guard = init_tracing(app_config.log.into());
 
-    info!(
-        "run bot with arguments, chain: {} base_token: {}, quote_token: {},  ws provider url: {:?}",
-        opts.network, opts.base_token, opts.quote_token, opts.url
-    );
-
-    if opts.url == None {
-        panic!("Must provider url");
-    }
-    let provider = Provider::<Ws>::connect(opts.url.clone().unwrap())
-        .await
-        .expect("ws connect error");
-
-    run(opts, provider).await;
+    run(opts).await;
     Ok(())
 }
 

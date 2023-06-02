@@ -1,16 +1,18 @@
 use super::Erc20Wrapper;
+use super::MuteSwitchFactoryWrapper;
 use crate::bindings::{
     flash_bots_router::UniswapWethParams, uniswap_v2_factory::UniswapV2Factory,
     uniswap_v2_pair::UniswapV2Pair, uniswap_v2_router_02::UniswapV2Router02, ERC20,
+    mute_switch_factory::MuteSwitchFactory
 };
 // use core::num;
 use ethers::prelude::*;
 use futures::future::join_all;
 use meta_common::{
     constants::ZERO_ADDRESS,
-    enums::{Dex, Network},
+    enums::{DexExchange, Network},
 };
-use meta_util::address_from_str;
+use meta_util::{address_from_str,address_to_str};
 
 use std::{
     borrow::BorrowMut,
@@ -21,38 +23,62 @@ use std::{
 };
 use tracing::{debug, error, info};
 
+pub enum UniswapV2FactoryEnum<M> {
+    UNISWAP_V2(UniswapV2Factory<M>),
+    MUTE_SWITCH(MuteSwitchFactory<M>)
+}
+
 pub struct UniswapV2<M> {
     // pub config_contract: Config<M>,
     pub network: Network,
-    pub dex: Dex,
-    pub factory_contract: UniswapV2Factory<M>,
-    pub swap_router_contract: UniswapV2Router02<M>,
+    pub dex: DexExchange,
+    pub factory_contract: UniswapV2FactoryEnum<M>,
+    // pub swap_router_contract: UniswapV2Router02<M>,
     pub client: Arc<M>,
 }
 
 impl<M: Middleware> UniswapV2<M> {
     pub fn new(
         network: Network,
-        dex: Dex,
+        dex: DexExchange,
         factory_address: Address,
         swap_router_addr: Address,
         client: Arc<M>,
     ) -> Self {
         // let config_contract = Config::new(config_address, client.clone());
-        let factory_contract = UniswapV2Factory::new(factory_address, client.clone());
+        debug!("init UniswapV2 with network {} dex {} factory_address {}",network, dex, factory_address);
+        let factory_contract = match dex {
+            DexExchange::MUTE_SWITCH => UniswapV2FactoryEnum::MUTE_SWITCH(MuteSwitchFactory::new(factory_address, client.clone())),
+            _ => UniswapV2FactoryEnum::UNISWAP_V2(UniswapV2Factory::new(factory_address, client.clone()))
+        };
         let swap_router_contract = UniswapV2Router02::new(swap_router_addr, client.clone());
         UniswapV2 {
             network,
             dex,
             factory_contract,
-            swap_router_contract,
+            // swap_router_contract,
             client,
         }
     }
 
-    pub async fn get_pair_addr(&self, tokenA: Address, tokenB: Address) -> Address {
-        let contract_addr = (self.factory_contract.get_pair(tokenA, tokenB).call().await).unwrap();
-        contract_addr
+    pub fn get_factory_address(&self) -> Address {
+        match &self.factory_contract {
+            UniswapV2FactoryEnum::MUTE_SWITCH(factory) => factory.address(),
+            UniswapV2FactoryEnum::UNISWAP_V2(factory) => factory.address(),
+        }
+    }
+
+    /// get uniswap v2 pair contract address given by token0, token1. token0 < token1
+    pub async fn get_pair_addr(&self, token0: Address, token1: Address) -> Address {
+        match &self.factory_contract {
+            UniswapV2FactoryEnum::MUTE_SWITCH(factory) => {
+                (factory).get_pair(token0, token1, false).call().await.unwrap()
+            },
+            UniswapV2FactoryEnum::UNISWAP_V2(factory) => {
+                (factory).get_pair(token0, token1).call().await.unwrap()
+            },
+        }
+
     }
 
     pub async fn get_pair_contract_wrapper(
@@ -60,12 +86,11 @@ impl<M: Middleware> UniswapV2<M> {
         token_a: Address,
         token_b: Address,
     ) -> UniswapV2PairWrapper<M> {
-        let contract_addr = (self
-            .factory_contract
-            .get_pair(token_a, token_b)
-            .call()
-            .await)
-            .unwrap();
+        debug!("get_pair_contract_wrapper, dex {}, factory_address {} token_a {}, token_b: {} ", self.dex, self.get_factory_address(), address_to_str(&token_a), address_to_str(&token_b));
+        let contract_addr = self
+            .get_pair_addr(token_a, token_b)
+            .await;
+        debug!("got pair address: {:?}", contract_addr);
         let pair_contract = UniswapV2Pair::new(contract_addr, self.client.clone());
         // let (token_0, token_1) = get_token_0_and_token_1(token_a, token_b);
         UniswapV2PairWrapper::new(self.network.clone(), self.dex.clone(), pair_contract).await
@@ -88,7 +113,7 @@ impl<M: Middleware> UniswapV2<M> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct UniswapV2Reserves {
     pub reserve_0: U128,
     pub reserve_1: U128,
@@ -102,7 +127,7 @@ pub struct Erc20Info {
     pub name: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct UniswapV2PairState {
     pub token_0: Erc20Info,
     pub token_1: Erc20Info,
@@ -112,14 +137,14 @@ pub struct UniswapV2PairState {
 #[derive(Clone)]
 pub struct UniswapV2PairWrapper<M> {
     pub network: Network,
-    pub dex: Dex,
+    pub dex: DexExchange,
     pub state: UniswapV2PairState,
     pub pair_contract: UniswapV2Pair<M>,
     // pub client: Arc<M>,
 }
 
 impl<M: Middleware> UniswapV2PairWrapper<M> {
-    async fn new(network: Network, dex: Dex, pair_contract: UniswapV2Pair<M>) -> Self {
+    async fn new(network: Network, dex: DexExchange, pair_contract: UniswapV2Pair<M>) -> Self {
         let tokens_rets = join_all([
             pair_contract.token_0().call(),
             pair_contract.token_1().call(),
@@ -194,11 +219,11 @@ impl<M: Middleware> UniswapV2PairWrapper<M> {
     }
 
     pub async fn update_state_and_return_price(&mut self, block_num: &BlockId) -> Option<f64> {
-        debug!("start get price for block number {:?}", block_num);
+        debug!("start get price for block number {:?}, state {:?}", block_num, self.state);
         let ret = self
             .pair_contract
             .get_reserves()
-            .block(*block_num)
+            // .block(*block_num)
             .call()
             .await;
 

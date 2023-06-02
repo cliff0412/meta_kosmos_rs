@@ -1,8 +1,27 @@
+use serde::Deserialize;
+use strum::{AsRefStr, Display, EnumCount, EnumIter, EnumString, EnumVariantNames};
 
-#[derive(Default, Clone, Debug, PartialEq, strum_macros::Display, strum_macros::EnumString)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    AsRefStr,         // AsRef<str>, fmt::Display and serde::Serialize
+    EnumVariantNames, // Chain::VARIANTS
+    EnumString,       // FromStr, TryFrom<&str>
+    EnumIter,         // Chain::iter
+    EnumCount,        // Chain::COUNT
+    // TryFromPrimitive, // TryFrom<u64>
+    Deserialize,
+    Display,
+)]
 pub enum Token {
-    #[default]
-    None,
+    #[strum(ascii_case_insensitive, serialize = "EMPTY")]
+    EMPTY,
 
     #[strum(ascii_case_insensitive, serialize = "WBNB")]
     WBNB,
@@ -12,6 +31,12 @@ pub enum Token {
 
     #[strum(ascii_case_insensitive, serialize = "USDC")]
     USDC,
+
+    #[strum(ascii_case_insensitive, serialize = "USDT")]
+    USDT,
+
+    #[strum(ascii_case_insensitive, serialize = "DAI")]
+    DAI,
 
     #[strum(ascii_case_insensitive, serialize = "BUSD")]
     BUSD,
@@ -27,10 +52,20 @@ pub enum Token {
 
     #[strum(ascii_case_insensitive, serialize = "C98")]
     C98,
+
+    #[strum(ascii_case_insensitive, serialize = "BSW")]
+    BSW,
 }
 
 impl Into<String> for Token {
     fn into(self) -> String {
         return self.to_string();
+    }
+}
+
+
+impl Default for Token {
+    fn default() -> Self {
+        Self::WETH
     }
 }
